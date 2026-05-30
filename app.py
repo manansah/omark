@@ -1,6 +1,8 @@
 import os
 import sys
 import queue
+import re
+import shutil
 import tempfile
 import threading
 import time
@@ -41,6 +43,7 @@ FONT_HEADING = ("Segoe UI", 11, "bold")
 FONT_BODY = ("Segoe UI", 10)
 FONT_BOLD = ("Segoe UI", 10, "bold")
 FONT_CONSOLE = ("Consolas", 10)
+SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx", ".png", ".jpg", ".jpeg"}
 
 # ==========================================
 # CUSTOM WIDGET HELPERS
@@ -99,10 +102,238 @@ def create_styled_entry(parent, textvariable=None, width=30, **kwargs):
     return border_frame, entry
 
 # ==========================================
+# TESSERACT SCAN PREPROCESSING
+# ==========================================
+def _normalize_scan_image(image):
+    """Improves low-contrast scans while preserving text edges for OCR."""
+    from PIL import ImageEnhance, ImageFilter, ImageOps
+
+    image = ImageOps.grayscale(image)
+    image = ImageOps.autocontrast(image, cutoff=1)
+    image = ImageEnhance.Contrast(image).enhance(1.35)
+    return image.filter(ImageFilter.SHARPEN)
+
+
+def _ocr_confidence(image, pytesseract):
+    """Returns a confidence score used to compare possible page rotations."""
+    from pytesseract import Output
+
+    data = pytesseract.image_to_data(
+        image, lang="eng+hin", config="--psm 6", output_type=Output.DICT
+    )
+    confidences = [
+        float(confidence)
+        for confidence, text in zip(data["conf"], data["text"])
+        if text.strip() and float(confidence) >= 0
+    ]
+    if not confidences:
+        return 0.0
+    return sum(confidences) / len(confidences)
+
+
+def _rotation_preview(image, max_width=1400):
+    """Keeps orientation checks reasonably fast on high-resolution PDF renders."""
+    if image.width <= max_width:
+        return image
+    ratio = max_width / image.width
+    return image.resize((max_width, max(1, int(image.height * ratio))))
+
+
+def _group_line_centers(indices):
+    """Collapses adjacent dark pixels into the center point of each table line."""
+    groups = []
+    for index in indices:
+        if not groups or index > groups[-1][-1] + 1:
+            groups.append([int(index)])
+        else:
+            groups[-1].append(int(index))
+    return [round((group[0] + group[-1]) / 2) for group in groups]
+
+
+def _detect_table_grid(image):
+    """Detects a bordered table using dark-pixel projections."""
+    import numpy as np
+
+    dark_pixels = np.asarray(image) < 100
+
+    def find_lines(projection):
+        threshold = max(0.05, float(projection.max()) * 0.5)
+        return _group_line_centers(np.where(projection > threshold)[0])
+
+    horizontal_lines = find_lines(dark_pixels.mean(axis=1))
+    vertical_lines = find_lines(dark_pixels.mean(axis=0))
+    rows = len(horizontal_lines) - 1
+    columns = len(vertical_lines) - 1
+    if rows < 2 or columns < 2 or rows * columns > 300:
+        return None
+    if min(
+        [right - left for left, right in zip(vertical_lines, vertical_lines[1:])]
+        + [bottom - top for top, bottom in zip(horizontal_lines, horizontal_lines[1:])]
+    ) < 12:
+        return None
+    return vertical_lines, horizontal_lines
+
+
+def _escape_markdown_cell(text):
+    return " ".join(text.split()).replace("|", r"\|")
+
+
+def _ocr_bordered_table(image, pytesseract, vertical_lines, horizontal_lines):
+    """Extracts a grid table cell-by-cell and returns Markdown."""
+    table_rows = []
+    for top, bottom in zip(horizontal_lines, horizontal_lines[1:]):
+        row = []
+        for left, right in zip(vertical_lines, vertical_lines[1:]):
+            cell = image.crop((left + 4, top + 4, right - 4, bottom - 4))
+            text = pytesseract.image_to_string(cell, lang="eng+hin", config="--psm 6")
+            row.append(_escape_markdown_cell(text))
+        table_rows.append(row)
+
+    columns = len(vertical_lines) - 1
+    header = [f"Column {index}" for index in range(1, columns + 1)]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * columns) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in table_rows)
+    return "\n".join(lines)
+
+
+def _ocr_tesseract_page(image, pytesseract, log=None):
+    """Normalizes, rotates, and deskews a rendered scan before final OCR."""
+    normalized = _normalize_scan_image(image)
+    preview = _rotation_preview(normalized)
+
+    coarse_candidates = []
+    for angle in (0, 90, 180, 270):
+        candidate = preview.rotate(angle, expand=True, fillcolor=255)
+        coarse_candidates.append((_ocr_confidence(candidate, pytesseract), angle))
+    coarse_score, coarse_angle = max(coarse_candidates)
+
+    fine_candidates = []
+    for offset in (-2, -1, 0, 1, 2):
+        angle = coarse_angle + offset
+        candidate = preview.rotate(angle, expand=True, fillcolor=255)
+        fine_candidates.append((_ocr_confidence(candidate, pytesseract), angle))
+    base_score = next(score for score, angle in fine_candidates if angle == coarse_angle)
+    best_score, best_angle = max(fine_candidates)
+    final_score, final_angle = (
+        (best_score, best_angle) if best_score >= base_score + 2 else (base_score, coarse_angle)
+    )
+
+    if log and final_angle % 360:
+        display_angle = (final_angle + 180) % 360 - 180
+        log("INFO", f"Auto-corrected scan rotation by {display_angle} degree(s).")
+    if log and final_score < 35:
+        log("INFO", "OCR confidence remains low after scan cleanup; review this page output.")
+
+    corrected = normalized.rotate(final_angle, expand=True, fillcolor=255)
+    table_grid = _detect_table_grid(corrected)
+    if table_grid:
+        vertical_lines, horizontal_lines = table_grid
+        if log:
+            log(
+                "INFO",
+                f"Detected bordered table with {len(horizontal_lines) - 1} row(s) "
+                f"and {len(vertical_lines) - 1} column(s).",
+            )
+        return _ocr_bordered_table(corrected, pytesseract, vertical_lines, horizontal_lines)
+    return pytesseract.image_to_string(corrected, lang="eng+hin", config="--psm 6")
+
+
+def _has_useful_text(text):
+    """Rejects empty native PDF extraction so scanned pages can fall back to OCR."""
+    compact_text = "".join(character for character in text if character.isalnum())
+    return len(compact_text) >= 30
+
+
+def _normalize_native_text(text):
+    """Cleans common PDF character-spacing artifacts without changing content."""
+    text = text or ""
+    text = re.sub(r"(?<=\d)\s+,(?=\d)", ",", text)
+    return " ".join(text.split())
+
+
+def _markdown_table(rows):
+    """Converts extracted PDF table cells into a Markdown table."""
+    cleaned_rows = [
+        [_escape_markdown_cell(_normalize_native_text(cell)) for cell in row]
+        for row in rows
+    ]
+    if not cleaned_rows or not any(cell for row in cleaned_rows for cell in row):
+        return ""
+    columns = max(len(row) for row in cleaned_rows)
+    cleaned_rows = [row + [""] * (columns - len(row)) for row in cleaned_rows]
+    header = cleaned_rows[0]
+    body = cleaned_rows[1:]
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * columns) + " |",
+    ]
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    return "\n".join(lines)
+
+
+def _extract_native_pdf_markdown(filepath):
+    """Uses PDF text and table geometry before resorting to OCR."""
+    import pdfplumber
+
+    markdown_pages = []
+    with pdfplumber.open(filepath) as doc:
+        for page in doc.pages:
+            page_parts = []
+            tables = page.extract_tables()
+            table_bboxes = [table.bbox for table in page.find_tables()]
+
+            if table_bboxes:
+                non_table_page = page
+                for x0, top, x1, bottom in table_bboxes:
+                    non_table_page = non_table_page.filter(
+                        lambda obj, left=x0, upper=top, right=x1, lower=bottom: not (
+                            obj.get("object_type") == "char"
+                            and left <= (obj["x0"] + obj["x1"]) / 2 <= right
+                            and upper <= (obj["top"] + obj["bottom"]) / 2 <= lower
+                        )
+                    )
+                page_text = _normalize_native_text(non_table_page.extract_text())
+            else:
+                page_text = _normalize_native_text(page.extract_text())
+
+            if page_text:
+                page_parts.append(page_text)
+            page_parts.extend(_markdown_table(table) for table in tables if table)
+            markdown_pages.append("\n\n".join(part for part in page_parts if part))
+
+    return "\n\n---\n\n".join(page for page in markdown_pages if page)
+
+
+def _run_final_markitdown_pass(markdown_text, md):
+    """Runs generated Markdown through MarkItDown before saving the final file."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_markdown = os.path.join(temp_dir, "generated.md")
+        with open(temp_markdown, "w", encoding="utf-8") as f:
+            f.write(markdown_text)
+        return md.convert(temp_markdown).text_content
+
+
+def _add_winget_links_to_path():
+    """Makes newly installed WinGet tools available without restarting Windows."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return
+    winget_links = os.path.join(local_app_data, "Microsoft", "WinGet", "Links")
+    if os.path.isdir(winget_links):
+        path_entries = os.environ.get("PATH", "").split(os.pathsep)
+        if winget_links.lower() not in {entry.lower() for entry in path_entries}:
+            os.environ["PATH"] = winget_links + os.pathsep + os.environ.get("PATH", "")
+
+
+# ==========================================
 # BACKGROUND WORKER CONVERSION ENGINE
 # ==========================================
 def conversion_worker(endpoint, model, files_list, output_dir, log_queue, 
-                      pause_event, stop_event, llm_prompt, force_ocr, pdf_scale):
+                      pause_event, stop_event, llm_prompt, ocr_backend, pdf_scale,
+                      final_markitdown_pass=False):
     """
     Executes the batch document-to-markdown conversion inside a background thread.
     Checks pause_event and stop_event cooperatively between file boundaries.
@@ -111,21 +342,37 @@ def conversion_worker(endpoint, model, files_list, output_dir, log_queue,
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_queue.put(("LOG", level, f"[{timestamp}] [{level}] {message}\n"))
 
-    log("START", "Initializing OpenAI client & MarkItDown...")
+    log("START", "Initializing document converter...")
     
     try:
-        from openai import OpenAI
+        _add_winget_links_to_path()
         from markitdown import MarkItDown
     except ImportError as e:
         log("ERROR", f"Required libraries not installed: {str(e)}.")
-        log("ERROR", "Please run: pip install openai markitdown")
+        log("ERROR", "Please run install_dependencies.bat.")
         log_queue.put(("STATUS", "IDLE"))
         return
-        
+
     try:
-        # Connect to Ollama API via OpenAI-compatible endpoint
-        client = OpenAI(base_url=endpoint, api_key="ollama")
-        md = MarkItDown(enable_plugins=True, llm_client=client, llm_model=model)
+        if ocr_backend == "Ollama Vision":
+            from openai import OpenAI
+            client = OpenAI(base_url=endpoint, api_key="ollama")
+            md = MarkItDown(enable_plugins=True, llm_client=client, llm_model=model)
+        else:
+            md = MarkItDown(enable_plugins=True)
+            if ocr_backend in ("Smart Local OCR", "Tesseract OCR"):
+                import pytesseract
+                tesseract_cmd = shutil.which("tesseract")
+                if not tesseract_cmd:
+                    default_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+                    if os.path.exists(default_tesseract):
+                        tesseract_cmd = default_tesseract
+                if not tesseract_cmd:
+                    raise RuntimeError("Tesseract OCR was not found. Run install_dependencies.bat.")
+                pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+                local_tessdata = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tessdata")
+                if os.path.isdir(local_tessdata):
+                    os.environ["TESSDATA_PREFIX"] = local_tessdata
     except Exception as e:
         log("ERROR", f"Failed to initialize MarkItDown: {str(e)}")
         log_queue.put(("STATUS", "IDLE"))
@@ -176,65 +423,100 @@ def conversion_worker(endpoint, model, files_list, output_dir, log_queue,
                 
             is_pdf = filepath.lower().endswith(".pdf")
             
-            # If visual OCR is forced for PDFs, render pages as images and process each page
-            if is_pdf and force_ocr:
-                log("INFO", f"Rendering PDF pages to images for visual OCR...")
+            is_image = filepath.lower().endswith((".png", ".jpg", ".jpeg"))
+            use_tesseract = ocr_backend in ("Smart Local OCR", "Tesseract OCR")
+            use_page_ocr = (
+                is_pdf and ocr_backend in ("Ollama Vision", "Tesseract OCR")
+            ) or (is_image and use_tesseract)
+
+            if is_pdf and ocr_backend == "Smart Local OCR":
+                try:
+                    full_text = _extract_native_pdf_markdown(filepath)
+                except Exception as e:
+                    log("INFO", f"Embedded PDF text extraction failed ({str(e)}). Trying OCR.")
+                    full_text = ""
+                if _has_useful_text(full_text):
+                    log("INFO", "Using embedded PDF text and table geometry; OCR is not needed for this file.")
+                else:
+                    log("INFO", "No useful embedded PDF text found. Falling back to local Tesseract OCR.")
+                    use_page_ocr = True
+
+            # OCR PDFs page-by-page when a visual OCR backend is selected.
+            if use_page_ocr and is_pdf:
+                log("INFO", f"Rendering PDF pages for {ocr_backend}...")
                 import pypdfium2 as pdfium
                 
                 with tempfile.TemporaryDirectory() as temp_dir:
-                    doc = pdfium.PdfDocument(filepath)
-                    total_pages = len(doc)
-                    log("PROCESSING", f"Rendered {total_pages} page(s). Performing layout-aware visual OCR...")
-                    
-                    markdown_pages = []
-                    for page_idx, page in enumerate(doc, 1):
-                        # Cooperative cancellation check between pages
-                        if stop_event.is_set():
-                            log("INFO", "Operation aborted by user.")
-                            log_queue.put(("STATUS", "IDLE"))
-                            return
-                            
-                        # Check pause between pages
-                        if not pause_event.is_set():
-                            log("INFO", "Operation paused. Waiting for resume...")
-                            log_queue.put(("STATUS", "PAUSED"))
-                            pause_event.wait()
+                    with pdfium.PdfDocument(filepath) as doc:
+                        total_pages = len(doc)
+                        log("PROCESSING", f"Rendered {total_pages} page(s). Performing {ocr_backend}...")
+
+                        markdown_pages = []
+                        for page_idx, page in enumerate(doc, 1):
+                            # Cooperative cancellation check between pages
                             if stop_event.is_set():
                                 log("INFO", "Operation aborted by user.")
                                 log_queue.put(("STATUS", "IDLE"))
                                 return
-                            log("INFO", "Resuming batch operation...")
-                            log_queue.put(("STATUS", "RUNNING"))
 
-                        log("PROCESSING", f"Processing page {page_idx} of {total_pages}...")
-                        
-                        # Render page at specified scale (lower scale runs faster)
-                        bitmap = page.render(scale=pdf_scale)
-                        pil_img = bitmap.to_pil()
-                        
-                        temp_image_path = os.path.join(temp_dir, f"page_{page_idx}.png")
-                        pil_img.save(temp_image_path)
-                        
-                        # Call MarkItDown with custom transcription prompt
-                        page_result = md.convert(temp_image_path, llm_prompt=llm_prompt)
-                        markdown_pages.append(page_result.text_content)
+                            # Check pause between pages
+                            if not pause_event.is_set():
+                                log("INFO", "Operation paused. Waiting for resume...")
+                                log_queue.put(("STATUS", "PAUSED"))
+                                pause_event.wait()
+                                if stop_event.is_set():
+                                    log("INFO", "Operation aborted by user.")
+                                    log_queue.put(("STATUS", "IDLE"))
+                                    return
+                                log("INFO", "Resuming batch operation...")
+                                log_queue.put(("STATUS", "RUNNING"))
+
+                            log("PROCESSING", f"Processing page {page_idx} of {total_pages}...")
+
+                            # Render page at specified scale (lower scale runs faster)
+                            bitmap = page.render(scale=pdf_scale)
+                            pil_img = bitmap.to_pil()
+
+                            temp_image_path = os.path.join(temp_dir, f"page_{page_idx}.png")
+                            pil_img.save(temp_image_path)
+
+                            if use_tesseract:
+                                import pytesseract
+                                page_log = lambda level, message: log(level, f"Page {page_idx}: {message}")
+                                markdown_pages.append(_ocr_tesseract_page(pil_img, pytesseract, page_log))
+                            else:
+                                page_result = md.convert(temp_image_path, llm_prompt=llm_prompt)
+                                markdown_pages.append(page_result.text_content)
                     
                     # Combine page conversions with page delimiters
-                    full_text = "\n\n--\n\n".join(markdown_pages)
+                    full_text = "\n\n---\n\n".join(markdown_pages)
                     
-                    base_name = Path(filename).stem
-                    dest_file = os.path.join(output_dir, f"{base_name}.md")
-                    with open(dest_file, "w", encoding="utf-8") as f:
-                        f.write(full_text)
+            elif use_page_ocr and is_image:
+                from PIL import Image
+                import pytesseract
+
+                log("INFO", "Performing local Tesseract OCR on image...")
+                with Image.open(filepath) as image:
+                    full_text = _ocr_tesseract_page(image.convert("RGB"), pytesseract, log)
+            elif is_pdf and ocr_backend == "Smart Local OCR":
+                pass
             else:
                 # Perform standard document extraction (MarkItDown decides based on format)
                 # Pass prompt to be utilized if LLM/vision fallback path is invoked
                 result = md.convert(filepath, llm_prompt=llm_prompt)
-                
-                base_name = Path(filename).stem
-                dest_file = os.path.join(output_dir, f"{base_name}.md")
-                with open(dest_file, "w", encoding="utf-8") as f:
-                    f.write(result.text_content)
+                full_text = result.text_content
+
+            if final_markitdown_pass:
+                log("INFO", "Running final Markdown through MarkItDown...")
+                try:
+                    full_text = _run_final_markitdown_pass(full_text, md)
+                except Exception as e:
+                    log("ERROR", f"Final MarkItDown pass failed ({str(e)}). Saving the generated Markdown unchanged.")
+
+            base_name = Path(filename).stem
+            dest_file = os.path.join(output_dir, f"{base_name}.md")
+            with open(dest_file, "w", encoding="utf-8") as f:
+                f.write(full_text)
                 
             successful_conversions += 1
             log("SUCCESS", f"Saved: {dest_file}")
@@ -255,10 +537,10 @@ def conversion_worker(endpoint, model, files_list, output_dir, log_queue,
 class MarkItDownApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Local Document to Markdown Converter")
-        self.root.geometry("800x820")
+        self.root.title("OMark - Offline Document to Markdown")
+        self.root.geometry("1080x860")
         self.root.configure(bg=BG_MAIN)
-        self.root.minsize(700, 700)
+        self.root.minsize(900, 720)
         
         self.selected_files = []
         self.log_queue = queue.Queue()
@@ -281,12 +563,12 @@ class MarkItDownApp:
         header_frame.grid(row=0, column=0, sticky="ew")
         header_frame.columnconfigure(0, weight=1)
         
-        lbl_title = tk.Label(header_frame, text="MARKITDOWN BATCH CONVERTER", font=FONT_TITLE, fg=ACCENT_PRIMARY, bg=BG_MAIN, anchor="w")
+        lbl_title = tk.Label(header_frame, text="OMARK OFFLINE DOCUMENT CONVERTER", font=FONT_TITLE, fg=ACCENT_PRIMARY, bg=BG_MAIN, anchor="w")
         lbl_title.grid(row=0, column=0, sticky="w")
         
         lbl_subtitle = tk.Label(
             header_frame, 
-            text="Convert PDFs, Word files, Presentations, Images and Spreadsheets to Markdown via local Qwen3.5 OCR.",
+            text="Create Markdown locally from PDFs, scans, images, Word files, presentations and spreadsheets. Ollama is optional.",
             font=FONT_SUBTITLE, fg=FG_SECONDARY, bg=BG_MAIN, anchor="w"
         )
         lbl_subtitle.grid(row=1, column=0, sticky="w")
@@ -297,25 +579,35 @@ class MarkItDownApp:
         cards_frame.columnconfigure(0, weight=1)
         cards_frame.columnconfigure(1, weight=1)
         
-        # -- CARD 1: OLLAMA CONFIGURATION --
-        cfg_card = tk.LabelFrame(cards_frame, text=" Ollama Settings ", font=FONT_HEADING, fg=FG_PRIMARY, bg=BG_CARD, bd=1, relief="flat", padx=12, pady=12)
+        # -- CARD 1: OCR CONFIGURATION --
+        cfg_card = tk.LabelFrame(cards_frame, text=" OCR Settings ", font=FONT_HEADING, fg=FG_PRIMARY, bg=BG_CARD, bd=1, relief="flat", padx=12, pady=12)
         cfg_card.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         cfg_card.columnconfigure(1, weight=1)
         
-        tk.Label(cfg_card, text="Ollama Endpoint:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=0, column=0, sticky="w", pady=4)
+        tk.Label(cfg_card, text="Conversion Mode:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=0, column=0, sticky="w", pady=4)
+        self.ocr_backend_var = tk.StringVar(value="Smart Local OCR")
+        self.cmb_ocr_backend = ttk.Combobox(
+            cfg_card, textvariable=self.ocr_backend_var,
+            values=["Smart Local OCR", "Tesseract OCR", "Native extraction", "Ollama Vision"],
+            state="readonly", font=FONT_BODY
+        )
+        self.cmb_ocr_backend.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
+        self.cmb_ocr_backend.bind("<<ComboboxSelected>>", self.update_backend_controls)
+
+        tk.Label(cfg_card, text="Ollama Endpoint:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=1, column=0, sticky="w", pady=4)
         self.endpoint_var = tk.StringVar(value="http://localhost:11434/v1")
         border_end, self.ent_endpoint = create_styled_entry(cfg_card, textvariable=self.endpoint_var)
-        border_end.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
-        
-        tk.Label(cfg_card, text="Vision Model:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=1, column=0, sticky="w", pady=4)
+        border_end.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
+
         self.model_var = tk.StringVar(value="qwen3.5:9b")
         border_mod, self.ent_model = create_styled_entry(cfg_card, textvariable=self.model_var)
-        border_mod.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=4)
+        border_mod.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=4)
+        tk.Label(cfg_card, text="Vision Model:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=2, column=0, sticky="w", pady=4)
         
         # Text prompt for OCR tuning
-        tk.Label(cfg_card, text="OCR Prompt:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=2, column=0, sticky="nw", pady=4)
+        tk.Label(cfg_card, text="OCR Prompt:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=3, column=0, sticky="nw", pady=4)
         prompt_border = tk.Frame(cfg_card, bg="#4b5563", bd=0, padx=1, pady=1)
-        prompt_border.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=4)
+        prompt_border.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
         
         self.txt_prompt = tk.Text(
             prompt_border,
@@ -338,13 +630,24 @@ class MarkItDownApp:
         self.txt_prompt.insert("1.0", default_prompt)
         self.txt_prompt.bind("<FocusIn>", lambda e: prompt_border.config(bg=ACCENT_PRIMARY))
         self.txt_prompt.bind("<FocusOut>", lambda e: prompt_border.config(bg="#4b5563"))
-        
-        # Checkbutton to force visual OCR rendering on PDFs
-        self.force_ocr_var = tk.BooleanVar(value=True)
-        self.chk_force_ocr = tk.Checkbutton(
+
+        tk.Label(cfg_card, text="OCR Quality/Speed:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=4, column=0, sticky="w", pady=4)
+        self.quality_var = tk.StringVar(value="Balanced (1.4x)")
+
+        self.cmb_quality = ttk.Combobox(
             cfg_card,
-            text="Force Visual OCR (Render PDF to images)",
-            variable=self.force_ocr_var,
+            textvariable=self.quality_var,
+            values=["Fast (1.0x)", "Balanced (1.4x)", "High (2.0x)"],
+            state="readonly",
+            font=FONT_BODY
+        )
+        self.cmb_quality.grid(row=4, column=1, sticky="ew", padx=(8, 0), pady=4)
+
+        self.final_markitdown_var = tk.BooleanVar(value=False)
+        self.chk_final_markitdown = tk.Checkbutton(
+            cfg_card,
+            text="Run final output through MarkItDown",
+            variable=self.final_markitdown_var,
             font=FONT_BODY,
             fg=FG_PRIMARY,
             bg=BG_CARD,
@@ -354,19 +657,14 @@ class MarkItDownApp:
             bd=0,
             relief="flat"
         )
-        tk.Label(cfg_card, text="OCR Quality/Speed:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=3, column=0, sticky="w", pady=4)
-        self.quality_var = tk.StringVar(value="Balanced (1.4x)")
-        
-        self.cmb_quality = ttk.Combobox(
-            cfg_card, 
-            textvariable=self.quality_var, 
-            values=["Fast (1.0x)", "Balanced (1.4x)", "High (2.0x)"],
-            state="readonly",
-            font=FONT_BODY
+        self.chk_final_markitdown.grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        self.backend_hint_var = tk.StringVar()
+        self.lbl_backend_hint = tk.Label(
+            cfg_card, textvariable=self.backend_hint_var, font=FONT_SUBTITLE,
+            fg=FG_SECONDARY, bg=BG_CARD, anchor="w", justify="left", wraplength=470
         )
-        self.cmb_quality.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
-        
-        self.chk_force_ocr.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.lbl_backend_hint.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         
         # -- CARD 2: FILE SELECTION & OUTPUTS --
         io_card = tk.LabelFrame(cards_frame, text=" Paths & Files ", font=FONT_HEADING, fg=FG_PRIMARY, bg=BG_CARD, bd=1, relief="flat", padx=12, pady=12)
@@ -401,16 +699,24 @@ class MarkItDownApp:
             selectforeground=FG_PRIMARY, font=FONT_BODY, height=4, relief="flat", bd=0, highlightthickness=0
         )
         self.lst_files.pack(fill="x", side="left", expand=True)
+
+        self.drop_hint_var = tk.StringVar(value="Drag and drop documents here, or use Browse Files.")
+        self.lbl_drop_hint = tk.Label(
+            io_card, textvariable=self.drop_hint_var, font=FONT_SUBTITLE,
+            fg=FG_SECONDARY, bg=BG_CARD, anchor="w"
+        )
+        self.lbl_drop_hint.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.setup_drag_and_drop()
         
         lst_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.lst_files.yview)
         lst_scroll.pack(fill="y", side="right")
         self.lst_files.config(yscrollcommand=lst_scroll.set)
         
         # Output directory selection
-        tk.Label(io_card, text="Output Folder:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=2, column=0, sticky="w", pady=4)
+        tk.Label(io_card, text="Output Folder:", font=FONT_BODY, fg=FG_PRIMARY, bg=BG_CARD).grid(row=3, column=0, sticky="w", pady=4)
         
         out_frame = tk.Frame(io_card, bg=BG_CARD)
-        out_frame.grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=4)
+        out_frame.grid(row=3, column=1, sticky="ew", padx=(8, 0), pady=4)
         out_frame.columnconfigure(0, weight=1)
         
         self.output_var = tk.StringVar()
@@ -422,6 +728,12 @@ class MarkItDownApp:
             bg=ACCENT_MUTED, hover_bg=ACCENT_MUTED_HOVER, width=3
         )
         self.btn_browse_output.grid(row=0, column=1, sticky="e")
+
+        self.btn_open_output = create_flat_button(
+            io_card, "Open Output Folder", self.open_output_dir,
+            bg=ACCENT_MUTED, hover_bg=ACCENT_MUTED_HOVER
+        )
+        self.btn_open_output.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         
         # ----------------- PROGRESS & CONVERSION CONTROL PANEL -----------------
         control_frame = tk.Frame(self.root, bg=BG_MAIN, padx=20, pady=10)
@@ -516,6 +828,43 @@ class MarkItDownApp:
     # ==========================================
     # COMPONENT TRIGGER HANDLERS
     # ==========================================
+    def setup_drag_and_drop(self):
+        """Registers file drops on the source-file list when tkinterdnd2 is available."""
+        try:
+            from tkinterdnd2 import DND_FILES
+            self.lst_files.drop_target_register(DND_FILES)
+            self.lst_files.dnd_bind("<<Drop>>", self.handle_file_drop)
+        except (ImportError, AttributeError):
+            self.drop_hint_var.set("Drag and drop unavailable. Run install_dependencies.bat, or use Browse Files.")
+
+    def add_source_files(self, files):
+        """Adds supported source files while ignoring duplicates and unsupported paths."""
+        added = 0
+        skipped = []
+        for filepath in files:
+            normalized_path = os.path.normpath(filepath)
+            extension = Path(normalized_path).suffix.lower()
+            if not os.path.isfile(normalized_path) or extension not in SUPPORTED_EXTENSIONS:
+                skipped.append(os.path.basename(normalized_path) or normalized_path)
+                continue
+            if normalized_path not in self.selected_files:
+                self.selected_files.append(normalized_path)
+                self.lst_files.insert(tk.END, os.path.basename(normalized_path))
+                added += 1
+
+        self.update_progress_labels_idle()
+        if added:
+            self.write_log("INFO", f"Added {added} source file(s).\n")
+        if skipped:
+            self.write_log("INFO", f"Skipped unsupported path(s): {', '.join(skipped)}\n")
+
+    def handle_file_drop(self, event):
+        """Adds files dragged from Explorer into the source-file list."""
+        if self.app_state != "IDLE":
+            self.write_log("INFO", "Files cannot be added while a conversion is running.\n")
+            return
+        self.add_source_files(self.root.tk.splitlist(event.data))
+
     def select_files(self):
         """Allows user to select multiple compatible documents for processing."""
         file_types = [
@@ -531,11 +880,7 @@ class MarkItDownApp:
             filetypes=file_types
         )
         if files:
-            for f in files:
-                if f not in self.selected_files:
-                    self.selected_files.append(f)
-                    self.lst_files.insert(tk.END, os.path.basename(f))
-            self.update_progress_labels_idle()
+            self.add_source_files(files)
 
     def clear_files(self):
         """Clears the queue of selected files."""
@@ -548,6 +893,35 @@ class MarkItDownApp:
         selected_dir = filedialog.askdirectory(title="Select Destination Folder")
         if selected_dir:
             self.output_var.set(selected_dir)
+
+    def open_output_dir(self):
+        """Opens the current output directory in Windows Explorer."""
+        output_dir = self.output_var.get().strip()
+        if not output_dir:
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
+            self.output_var.set(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        os.startfile(output_dir)
+
+    def update_backend_controls(self, event=None):
+        """Keeps Ollama-only controls out of the way during offline conversion."""
+        is_idle = self.app_state == "IDLE"
+        backend = self.ocr_backend_var.get()
+        uses_ollama = backend == "Ollama Vision"
+        uses_rendering = backend != "Native extraction"
+
+        self.ent_endpoint.config(state=tk.NORMAL if is_idle and uses_ollama else tk.DISABLED)
+        self.ent_model.config(state=tk.NORMAL if is_idle and uses_ollama else tk.DISABLED)
+        self.txt_prompt.config(state=tk.NORMAL if is_idle and uses_ollama else tk.DISABLED)
+        self.cmb_quality.config(state="readonly" if is_idle and uses_rendering else tk.DISABLED)
+
+        hints = {
+            "Smart Local OCR": "Recommended offline mode: uses embedded PDF text and table geometry when available, then Tesseract OCR with scan rotation, cleanup and scanned-table extraction.",
+            "Tesseract OCR": "Offline scan mode: always renders PDFs and uses Tesseract OCR. Useful when a PDF text layer is incorrect.",
+            "Native extraction": "Fast offline mode: reads embedded document text only. Scanned PDFs and images may produce empty output.",
+            "Ollama Vision": "Optional AI mode: sends rendered PDF pages to your local Ollama vision model.",
+        }
+        self.backend_hint_var.set(hints.get(backend, ""))
 
     def update_progress_labels_idle(self):
         """Helper to reflect the current count of loaded files when in idle state."""
@@ -577,18 +951,19 @@ class MarkItDownApp:
 
         endpoint = self.endpoint_var.get().strip()
         model = self.model_var.get().strip()
+        ocr_backend = self.ocr_backend_var.get()
         
-        if not endpoint:
+        if ocr_backend == "Ollama Vision" and not endpoint:
             messagebox.showwarning("Invalid Input", "Ollama endpoint URL cannot be blank.")
             return
 
         # Auto-append /v1 if missing for Ollama OpenAI compatibility
-        if not endpoint.endswith("/v1") and not endpoint.endswith("/v1/"):
+        if ocr_backend == "Ollama Vision" and not endpoint.endswith("/v1") and not endpoint.endswith("/v1/"):
             sanitized_endpoint = endpoint.rstrip("/") + "/v1"
             self.write_log("INFO", f"Auto-sanitized endpoint: {endpoint} -> {sanitized_endpoint}\n")
             endpoint = sanitized_endpoint
 
-        if not model:
+        if ocr_backend == "Ollama Vision" and not model:
             messagebox.showwarning("Invalid Input", "Ollama model name cannot be blank.")
             return
 
@@ -602,7 +977,7 @@ class MarkItDownApp:
 
         # Get visual OCR preferences
         llm_prompt = self.txt_prompt.get("1.0", tk.END).strip()
-        force_ocr = self.force_ocr_var.get()
+        final_markitdown_pass = self.final_markitdown_var.get()
 
         # Initialize thread events
         self.pause_event.set()      # Unpaused by default
@@ -628,7 +1003,8 @@ class MarkItDownApp:
         worker_thread = threading.Thread(
             target=conversion_worker,
             args=(endpoint, model, self.selected_files, output_dir, self.log_queue, 
-                  self.pause_event, self.stop_event, llm_prompt, force_ocr, pdf_scale),
+                  self.pause_event, self.stop_event, llm_prompt, ocr_backend, pdf_scale,
+                  final_markitdown_pass),
             daemon=True
         )
         worker_thread.start()
@@ -664,12 +1040,11 @@ class MarkItDownApp:
         self.btn_select_files.config(state=entry_state)
         self.btn_clear_files.config(state=entry_state)
         self.btn_browse_output.config(state=entry_state)
-        self.ent_endpoint.config(state=entry_state)
-        self.ent_model.config(state=entry_state)
+        self.btn_open_output.config(state=entry_state)
         self.ent_output.config(state=entry_state)
-        self.txt_prompt.config(state=entry_state)
-        self.chk_force_ocr.config(state=entry_state)
-        self.cmb_quality.config(state="readonly" if is_idle else tk.DISABLED)
+        self.cmb_ocr_backend.config(state="readonly" if is_idle else tk.DISABLED)
+        self.chk_final_markitdown.config(state=entry_state)
+        self.update_backend_controls()
         
         # Toggle control button configurations and background colors
         if is_idle:
@@ -756,6 +1131,10 @@ class MarkItDownApp:
             self.root.after(100, self.poll_queue)
 
 if __name__ == "__main__":
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except ImportError:
+        root = tk.Tk()
     app = MarkItDownApp(root)
     root.mainloop()

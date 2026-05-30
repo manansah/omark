@@ -1,0 +1,7 @@
+markitdown[all]
+numpy
+openai
+pillow
+pypdfium2
+pytesseract
+tkinterdnd2

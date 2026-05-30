@@ -27,15 +27,42 @@ It is optimized for layout-aware OCR with native support for mixed English and H
    ```powershell
    ollama pull qwen3.5:9b
    ```
-3. Install the dependencies (including PDF and office format parsers):
+3. On Windows, run the included dependency installer. It installs Tesseract OCR,
+   FFmpeg, and Python dependencies for PDF, Word, Excel, PowerPoint, and optional
+   audio conversion into a local `.venv`:
    ```powershell
-   pip install openai markitdown[all]
+   .\install_dependencies.bat
+   ```
+
+   To install only the Python dependencies manually:
+   ```powershell
+   pip install -r requirements.txt
    ```
 
 ## Usage
 
 Run the desktop application:
 ```powershell
-python app.py
+.\run_omark.bat
 ```
-Select your files, configure your local Ollama endpoint (e.g. `http://localhost:11434/v1`), set your model name, choose your output folder, and hit **Start Conversion**.
+Select a conversion mode:
+- **Smart Local OCR**: recommended offline mode. Uses embedded PDF text and native table
+  geometry where available, then automatically falls back to Tesseract OCR for scanned
+  PDFs and images.
+- **Tesseract OCR**: forces local OCR for PDF pages and images. The installer adds English
+  and Hindi OCR support.
+- **Ollama Vision**: layout-aware visual OCR through a local multimodal Ollama model.
+- **Native extraction**: embedded PDF text extraction without OCR.
+
+Word (`.docx`), Excel (`.xlsx`), and PowerPoint (`.pptx`) files are parsed directly
+through MarkItDown regardless of the selected PDF backend.
+
+Source documents can be selected with **Browse Files** or dragged from Windows Explorer
+onto the source-file list.
+
+Tesseract PDF OCR automatically improves scan contrast, corrects sideways and
+upside-down pages, applies small deskew corrections when confidence improves, and
+converts bordered scan tables into Markdown tables cell-by-cell.
+
+Enable **Run final output through MarkItDown** to pass the generated Markdown through
+MarkItDown once more before saving. This is optional and disabled by default.
