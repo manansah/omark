@@ -1,0 +1,17 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local conversion output directory
+outputs/
+
+# Temporary system / OS files
+.DS_Store
+Thumbs.db
