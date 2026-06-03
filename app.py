@@ -588,7 +588,7 @@ class MarkItDownApp:
         self.ocr_backend_var = tk.StringVar(value="Smart Local OCR")
         self.cmb_ocr_backend = ttk.Combobox(
             cfg_card, textvariable=self.ocr_backend_var,
-            values=["Smart Local OCR", "Tesseract OCR", "Native extraction", "Ollama Vision"],
+            values=["Smart Local OCR", "Tesseract OCR", "Pure MarkItDown (No OCR)", "Ollama Vision"],
             state="readonly", font=FONT_BODY
         )
         self.cmb_ocr_backend.grid(row=0, column=1, sticky="ew", padx=(8, 0), pady=4)
@@ -908,7 +908,7 @@ class MarkItDownApp:
         is_idle = self.app_state == "IDLE"
         backend = self.ocr_backend_var.get()
         uses_ollama = backend == "Ollama Vision"
-        uses_rendering = backend != "Native extraction"
+        uses_rendering = backend != "Pure MarkItDown (No OCR)"
 
         self.ent_endpoint.config(state=tk.NORMAL if is_idle and uses_ollama else tk.DISABLED)
         self.ent_model.config(state=tk.NORMAL if is_idle and uses_ollama else tk.DISABLED)
@@ -918,7 +918,7 @@ class MarkItDownApp:
         hints = {
             "Smart Local OCR": "Recommended offline mode: uses embedded PDF text and table geometry when available, then Tesseract OCR with scan rotation, cleanup and scanned-table extraction.",
             "Tesseract OCR": "Offline scan mode: always renders PDFs and uses Tesseract OCR. Useful when a PDF text layer is incorrect.",
-            "Native extraction": "Fast offline mode: reads embedded document text only. Scanned PDFs and images may produce empty output.",
+            "Pure MarkItDown (No OCR)": "Pure Microsoft MarkItDown: runs standard document-to-markdown extraction without any custom or AI OCR pipelines.",
             "Ollama Vision": "Optional AI mode: sends rendered PDF pages to your local Ollama vision model.",
         }
         self.backend_hint_var.set(hints.get(backend, ""))
