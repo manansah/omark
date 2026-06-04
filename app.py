@@ -249,29 +249,106 @@ def _has_useful_text(text):
 
 def _normalize_native_text(text):
     """Cleans common PDF character-spacing artifacts without changing content."""
-    text = text or ""
+    return _normalize_pdf_cell_text(text, preserve_lines=False)
+
+
+def _normalize_pdf_cell_text(text, preserve_lines=False):
+    """Cleans PDF cell text while optionally preserving intended line breaks."""
+    text = (text or "").replace("\u200b", "")
     text = re.sub(r"(?<=\d)\s+,(?=\d)", ",", text)
-    return " ".join(text.split())
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    if preserve_lines:
+        return "<br>".join(lines)
+    return " ".join(lines)
+
+
+def _markdown_breaks_to_lines(text):
+    return text.replace("<br>", "\n")
+
+
+def _non_empty_cells(row):
+    return [cell for cell in row if cell]
+
+
+def _pad_rows(rows):
+    columns = max((len(row) for row in rows), default=0)
+    return [row + [""] * (columns - len(row)) for row in rows]
+
+
+def _move_split_header_columns(header, body):
+    """Moves a header label onto the adjacent data column when PDFs split them."""
+    for index in range(len(header) - 1):
+        current_body_empty = all(not row[index] for row in body)
+        next_body_has_values = any(row[index + 1] for row in body)
+        if header[index] and not header[index + 1] and current_body_empty and next_body_has_values:
+            header[index + 1] = header[index]
+            header[index] = ""
+
+
+def _drop_empty_columns(header, body):
+    keep_indexes = [
+        index
+        for index in range(len(header))
+        if header[index] or any(row[index] for row in body)
+    ]
+    return [header[index] for index in keep_indexes], [
+        [row[index] for index in keep_indexes] for row in body
+    ]
+
+
+def _fill_merged_first_column(body):
+    """Repeats visually merged first-column labels so each Markdown row is complete."""
+    last_value = ""
+    for row in body:
+        if row and row[0]:
+            last_value = row[0]
+        elif row and last_value:
+            row[0] = last_value
 
 
 def _markdown_table(rows):
     """Converts extracted PDF table cells into a Markdown table."""
-    cleaned_rows = [
-        [_escape_markdown_cell(_normalize_native_text(cell)) for cell in row]
+    cleaned_rows = _pad_rows([
+        [_normalize_pdf_cell_text(cell, preserve_lines=True) for cell in row]
         for row in rows
-    ]
+    ])
     if not cleaned_rows or not any(cell for row in cleaned_rows for cell in row):
         return ""
-    columns = max(len(row) for row in cleaned_rows)
-    cleaned_rows = [row + [""] * (columns - len(row)) for row in cleaned_rows]
-    header = cleaned_rows[0]
+
+    captions = []
+    while cleaned_rows and len(_non_empty_cells(cleaned_rows[0])) == 1:
+        captions.append(_markdown_breaks_to_lines(_non_empty_cells(cleaned_rows[0])[0]))
+        cleaned_rows.pop(0)
+
+    if not cleaned_rows:
+        return "\n\n".join(captions)
+
+    header = [_normalize_native_text(cell.replace("<br>", " ")) for cell in cleaned_rows[0]]
     body = cleaned_rows[1:]
+
+    notes = []
+    while body and len(_non_empty_cells(body[-1])) <= 1:
+        note_cells = _non_empty_cells(body.pop())
+        if note_cells:
+            notes.append(_markdown_breaks_to_lines(note_cells[0]))
+
+    body = [row for row in body if _non_empty_cells(row)]
+    _move_split_header_columns(header, body)
+    header, body = _drop_empty_columns(header, body)
+    _fill_merged_first_column(body)
+
+    if not header or not body:
+        return "\n\n".join(captions + list(reversed(notes)))
+
+    columns = len(header)
     lines = [
-        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(_escape_markdown_cell(cell) for cell in header) + " |",
         "| " + " | ".join(["---"] * columns) + " |",
     ]
-    lines.extend("| " + " | ".join(row) + " |" for row in body)
-    return "\n".join(lines)
+    lines.extend("| " + " | ".join(_escape_markdown_cell(cell) for cell in row) + " |" for row in body)
+    table = "\n".join(lines)
+    return "\n\n".join(captions + [table] + list(reversed(notes)))
 
 
 def _extract_native_pdf_markdown(filepath):
